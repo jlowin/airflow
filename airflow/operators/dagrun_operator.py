@@ -7,8 +7,9 @@ from airflow import settings
 
 
 class DagRunOrder(object):
-    def __init__(self, run_id=None, payload=None):
-        self.run_id = run_id
+    def __init__(self, dag_id, execution_date, payload=None):
+        self.dag_id = dag_id
+        self.execution_date = execution_date
         self.payload = payload
 
 
@@ -21,10 +22,10 @@ class TriggerDagRunOperator(BaseOperator):
     :param python_callable: a reference to a python function that will be
         called while passing it the ``context`` object and a placeholder
         object ``obj`` for your callable to fill and return if you want
-        a DagRun created. This ``obj`` object contains a ``run_id`` and
+        a DagRun created. This ``obj`` object contains a ``dag_id``,
+        ``execution_date``, and
         ``payload`` attribute that you can modify in your function.
-        The ``run_id`` should be a unique identifier for that DAG run, and
-        the payload has to be a picklable object that will be made available
+        The payload has to be a picklable object that will be made available
         to your tasks while executing that DAG run. Your function header
         should look like ``def foo(context, dag_run_obj):``
     :type python_callable: python callable
@@ -43,15 +44,17 @@ class TriggerDagRunOperator(BaseOperator):
         self.trigger_dag_id = trigger_dag_id
 
     def execute(self, context):
-        dro = DagRunOrder(run_id='trig__' + datetime.now().isoformat())
+        execution_date = datetime.now()
+        dro = DagRunOrder(
+            dag_id=self.trigger_dag_id,
+            execution_date=execution_date)
         dro = self.python_callable(context, dro)
         if dro:
             session = settings.Session()
             dr = DagRun(
                 dag_id=self.trigger_dag_id,
-                run_id=dro.run_id,
-                conf=dro.payload,
-                external_trigger=True)
+                execution_date=execution_date)
+            dr.set_conf(dro.payload)
             logging.info("Creating DagRun {}".format(dr))
             session.add(dr)
             session.commit()

@@ -48,7 +48,7 @@ class State(object):
         if state in cls.state_color:
             return cls.state_color[state]
         else:
-            return 'white'
+            return 'lightgray'
 
     @classmethod
     def color_fg(cls, state):
@@ -60,14 +60,14 @@ class State(object):
 
     @classmethod
     def runnable(cls):
-        return [
+        return set([
             cls.NONE,
             cls.FAILED,
             cls.UP_FOR_RETRY,
             cls.UPSTREAM_FAILED,
             cls.SKIPPED,
             cls.QUEUED
-        ]
+        ])
 
     @classmethod
     def finished(cls):
@@ -76,12 +76,12 @@ class State(object):
         run attempt. Note that the attempt could have resulted in failure or
         have been interrupted; in any case, it is no longer running.
         """
-        return [
+        return set([
             cls.SUCCESS,
             cls.SHUTDOWN,
             cls.FAILED,
             cls.SKIPPED,
-        ]
+        ])
 
     @classmethod
     def unfinished(cls):
@@ -89,9 +89,9 @@ class State(object):
         A list of states indicating that a task either has not completed
         a run or has not even started.
         """
-        return [
+        return set([
             cls.NONE,
             cls.QUEUED,
             cls.RUNNING,
             cls.UP_FOR_RETRY
-        ]
+        ])

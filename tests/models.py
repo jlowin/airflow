@@ -24,11 +24,11 @@ import time
 
 from airflow import models, AirflowException
 from airflow.exceptions import AirflowSkipException
-from airflow.models import DAG, TaskInstance as TI
+from airflow.models import DAG, DagBag, DagRun, DagModel, TaskInstance as TI
 from airflow.models import State as ST
-from airflow.models import DagModel
 from airflow.operators import DummyOperator, BashOperator, PythonOperator
 from airflow.utils.state import State
+from airflow.utils.db import provide_session
 from mock import patch
 from nose_parameterized import parameterized
 
@@ -115,11 +115,243 @@ class DagTest(unittest.TestCase):
         self.assertEqual(dag.tasks[0].task_id, 'op6')
 
 class DagRunTest(unittest.TestCase):
-    def test_id_for_date(self):
-        run_id = models.DagRun.id_for_date(
-            datetime.datetime(2015, 1, 2, 3, 4, 5, 6, None))
-        assert run_id == 'scheduled__2015-01-02T03:04:05', (
-            'Generated run_id did not match expectations: {0}'.format(run_id))
+
+    def test_comparison(self):
+        """
+        Test DagRun ==, >, and hashing ops
+        """
+        d1 = DagRun('dag', DEFAULT_DATE)
+        d2 = DagRun('dag', DEFAULT_DATE)
+        d3 = DagRun('dag2', DEFAULT_DATE)
+        d4 = DagRun('dag2', DEFAULT_DATE + datetime.timedelta(days=1))
+
+        self.assertEqual(d1, d2)
+        self.assertGreater(d3, d2)
+        self.assertGreater(d4, d3)
+
+        s = set([d1, d2, d3, d4])
+        # d1 and d2 are the same and should not be double counted in the set
+        self.assertEqual(len(s), 3)
+        # however all DRs should report that they are "in" the set
+        for d in [d1, d2, d3, d4]:
+            self.assertIn(d, s)
+
+    def test_set_lock(self):
+        """
+        Test locking DagRuns and syncing state to other (identical) DagRuns
+        """
+        d1 = DagRun('dag', DEFAULT_DATE)
+        d2 = DagRun('dag', DEFAULT_DATE)
+
+        # locked starts out as False
+        self.assertEqual((d1.locked, d2.locked), (False, False))
+        d1.lock()
+        d2.refresh_from_db()
+        self.assertEqual((d1.locked, d2.locked), (True, True))
+        # unlock d1 and sync
+        d1.unlock()
+        d2.refresh_from_db()
+        self.assertEqual((d1.locked, d2.locked), (False, False))
+
+    def test_cant_modify_locked(self):
+        """
+        Test that locked DagRuns can't be modified
+        """
+        d1 = DagRun('dag', DEFAULT_DATE)
+        d2 = DagRun('dag', DEFAULT_DATE)
+        d1.lock(lock_id=25)
+
+        # process 25 can re-lock d1
+        d1.lock(lock_id=25)
+
+        # but process 26 can't lock d1 because process 25 already did
+        self.assertRaises(AirflowException, d1.lock, lock_id=26)
+
+    def test_set_conf(self):
+        """
+        Test setting DagRun conf and syncing to other (identical) DagRuns
+        """
+        d1 = DagRun('dag', DEFAULT_DATE)
+        d2 = DagRun('dag', DEFAULT_DATE)
+
+        # conf is None
+        self.assertEqual((d1.conf, d2.conf), (None, None))
+        # set d1 conf
+        d1.set_conf(1)
+        d2.refresh_from_db()
+        self.assertEqual((d1.conf, d2.conf), (1, 1))
+
+    def test_initial_state(self):
+        """
+        Test that DagRuns start in PENDING state
+        """
+        d1 = DagRun('dag', DEFAULT_DATE)
+        # db object gets default state: PENDING
+        self.assertEqual(d1.state, ST.PENDING)
+        d1.refresh_from_db()
+        self.assertEqual(d1.state, ST.PENDING)
+
+    def test_update_state(self):
+        """
+        Test state modification
+        """
+        d1 = DagRun('dag', DEFAULT_DATE)
+        self.assertEqual(d1.state, ST.PENDING)
+        self.assertIs(d1.start_date, None)
+        self.assertIs(d1.end_date, None)
+
+        # changing to RUNNING should change start_date
+        d1.set_state(ST.RUNNING)
+        self.assertEqual(d1.state, ST.RUNNING)
+        self.assertIsNot(d1.start_date, None)
+        sd = d1.start_date
+
+        # changing to SUCCESS should set end_date
+        d1.set_state(ST.SUCCESS)
+        self.assertEqual(d1.state, ST.SUCCESS)
+        self.assertEqual(d1.start_date, sd)
+        self.assertIsNot(d1.end_date, None)
+
+        # back to PENDING, should reset
+        d1.set_state(ST.PENDING)
+        self.assertEqual(d1.state, ST.PENDING)
+        self.assertIs(d1.start_date, None)
+        self.assertIs(d1.end_date, None)
+
+        # and failed, should set end date
+        d1.set_state(ST.FAILED)
+        self.assertEqual(d1.state, ST.FAILED)
+        self.assertIs(d1.start_date, None)
+        self.assertIsNot(d1.end_date, None)
+
+        # invalid state
+        self.assertRaises(AirflowException, d1.set_state, 'fake state')
+
+    @provide_session
+    def evaluate_dagrun(
+            self,
+            dag_id,
+            expected_task_states,  # dict of task_id: state
+            dagrun_state,
+            run_kwargs=None,
+            advance_execution_date=False,
+            session=None):
+        """
+        Helper for testing DagRun states with simple two-task DAGS
+        """
+        if run_kwargs is None:
+            run_kwargs = {}
+
+        dag = DagBag().get_dag(dag_id)
+        dag.clear()
+        if advance_execution_date:
+            # run a second time to schedule a dagrun after the start_date
+            dr = dag.schedule_dag(
+                last_scheduled=DEFAULT_DATE + datetime.timedelta(days=5))
+        else:
+            dr = dag.schedule_dag()
+        ex_date = dr.execution_date
+
+        try:
+            dag.run(start_date=ex_date, end_date=ex_date, **run_kwargs)
+        except AirflowException:
+            pass
+
+        # test tasks
+        for task_id, expected_state in expected_task_states.items():
+            task = dag.get_task(task_id)
+            ti = TI(task, ex_date)
+            ti.refresh_from_db()
+            self.assertEqual(ti.state, expected_state)
+
+        dr.refresh_from_db()
+        self.assertEqual(dr.state, dagrun_state)
+
+    def test_dagrun_fail(self):
+        """
+        DagRuns with one failed and one incomplete root task -> FAILED
+        """
+        self.evaluate_dagrun(
+            dag_id='test_dagrun_states_fail',
+            expected_task_states={
+                'test_dagrun_fail': State.FAILED,
+                'test_dagrun_succeed': State.UPSTREAM_FAILED,
+            },
+            dagrun_state=State.FAILED)
+
+    def test_dagrun_success(self):
+        """
+        DagRuns with one failed and one successful root task -> SUCCESS
+        """
+        self.evaluate_dagrun(
+            dag_id='test_dagrun_states_success',
+            expected_task_states={
+                'test_dagrun_fail': State.FAILED,
+                'test_dagrun_succeed': State.SUCCESS,
+            },
+            dagrun_state=State.SUCCESS)
+
+    def test_dagrun_root_fail(self):
+        """
+        DagRuns with one successful and one failed root task -> FAILED
+        """
+        self.evaluate_dagrun(
+            dag_id='test_dagrun_states_root_fail',
+            expected_task_states={
+                'test_dagrun_succeed': State.SUCCESS,
+                'test_dagrun_fail': State.FAILED,
+            },
+            dagrun_state=State.FAILED)
+
+    def test_dagrun_deadlock(self):
+        """
+        Deadlocked DagRun is marked a failure
+
+        Test that a deadlocked dagrun is marked as a failure by having
+        depends_on_past and an execution_date after the start_date
+        """
+        self.evaluate_dagrun(
+            dag_id='test_dagrun_states_deadlock',
+            expected_task_states={
+                'test_depends_on_past': None,
+                'test_depends_on_past_2': None,
+            },
+            dagrun_state=State.FAILED,
+            advance_execution_date=True)
+
+    def test_dagrun_deadlock_ignore_depends_on_past_advance_ex_date(self):
+        """
+        DagRun is marked a success if ignore_first_depends_on_past=True
+
+        Test that an otherwise-deadlocked dagrun is marked as a success
+        if ignore_first_depends_on_past=True and the dagrun execution_date
+        is after the start_date.
+        """
+        self.evaluate_dagrun(
+            dag_id='test_dagrun_states_deadlock',
+            expected_task_states={
+                'test_depends_on_past': State.SUCCESS,
+                'test_depends_on_past_2': State.SUCCESS,
+            },
+            dagrun_state=State.SUCCESS,
+            advance_execution_date=True,
+            run_kwargs=dict(ignore_first_depends_on_past=True))
+
+    def test_dagrun_deadlock_ignore_depends_on_past(self):
+        """
+        Test that ignore_first_depends_on_past doesn't affect results
+        (this is the same test as
+        test_dagrun_deadlock_ignore_depends_on_past_advance_ex_date except
+        that start_date == execution_date so depends_on_past is irrelevant).
+        """
+        self.evaluate_dagrun(
+            dag_id='test_dagrun_states_deadlock',
+            expected_task_states={
+                'test_depends_on_past': State.SUCCESS,
+                'test_depends_on_past_2': State.SUCCESS,
+            },
+            dagrun_state=State.SUCCESS,
+            run_kwargs=dict(ignore_first_depends_on_past=True))
 
 
 class DagBagTest(unittest.TestCase):

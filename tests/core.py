@@ -106,16 +106,14 @@ class CoreTest(unittest.TestCase):
             owner='Also fake',
             start_date=datetime(2015, 1, 2, 0, 0)))
 
-        dag_run = jobs.SchedulerJob(test_mode=True).schedule_dag(dag)
+        dag_run = dag.schedule_dag()
         assert dag_run is not None
         assert dag_run.dag_id == dag.dag_id
-        assert dag_run.run_id is not None
-        assert dag_run.run_id != ''
-        assert dag_run.execution_date == datetime(2015, 1, 2, 0, 0), (
-            'dag_run.execution_date did not match expectation: {0}'
-                .format(dag_run.execution_date))
-        assert dag_run.state == State.RUNNING
-        assert dag_run.external_trigger == False
+        assert dag_run.execution_date == datetime(2015, 1, 2)
+
+        assert dag_run.state == State.NONE
+        dag_run.refresh_from_db()
+        assert dag_run.state == State.PENDING
 
     def test_schedule_dag_fake_scheduled_previous(self):
         """
@@ -139,7 +137,7 @@ class CoreTest(unittest.TestCase):
             external_trigger=True)
         settings.Session().add(trigger)
         settings.Session().commit()
-        dag_run = scheduler.schedule_dag(dag)
+        dag_run = scheduler._schedule_dag(dag)
         assert dag_run is not None
         assert dag_run.dag_id == dag.dag_id
         assert dag_run.run_id is not None
@@ -152,8 +150,8 @@ class CoreTest(unittest.TestCase):
 
     def test_schedule_dag_once(self):
         """
-        Tests scheduling a dag scheduled for @once - should be scheduled the first time
-        it is called, and not scheduled the second.
+        Tests scheduling a dag scheduled for @once - should be scheduled
+        the first time it is called, and not scheduled the second.
         """
         dag = DAG(TEST_DAG_ID + 'test_schedule_dag_once')
         dag.schedule_interval = '@once'
@@ -161,8 +159,8 @@ class CoreTest(unittest.TestCase):
             task_id="faketastic",
             owner='Also fake',
             start_date=datetime(2015, 1, 2, 0, 0)))
-        dag_run = jobs.SchedulerJob(test_mode=True).schedule_dag(dag)
-        dag_run2 = jobs.SchedulerJob(test_mode=True).schedule_dag(dag)
+        dag_run = dag.schedule_dag()
+        dag_run2 = dag.schedule_dag()
 
         assert dag_run is not None
         assert dag_run2 is None
@@ -183,23 +181,17 @@ class CoreTest(unittest.TestCase):
 
         # Create and schedule the dag runs
         dag_runs = []
-        scheduler = jobs.SchedulerJob(test_mode=True)
         for i in range(runs):
-            date = dag.start_date + i * delta
-            task = models.BaseOperator(task_id='faketastic__%s' % i,
-                                       owner='Also fake',
-                                       start_date=date)
-            dag.task_dict[task.task_id] = task
-            dag_runs.append(scheduler.schedule_dag(dag))
+            dag_runs.append(dag.schedule_dag())
 
-        additional_dag_run = scheduler.schedule_dag(dag)
+        additional_dag_run = dag.schedule_dag()
 
         for dag_run in dag_runs:
             assert dag_run is not None
 
         assert additional_dag_run is None
 
-    @mock.patch('airflow.jobs.datetime', FakeDatetime)
+    @mock.patch('airflow.models.datetime', FakeDatetime)
     def test_schedule_dag_no_end_date_up_to_today_only(self):
         """
         Tests that a Dag created without an end_date can only be scheduled up
@@ -221,32 +213,44 @@ class CoreTest(unittest.TestCase):
                   schedule_interval=delta)
 
         dag_runs = []
-        scheduler = jobs.SchedulerJob(test_mode=True)
         for i in range(runs):
-            # Create the DagRun
-            date = dag.start_date + i * delta
-            task = models.BaseOperator(task_id='faketastic__%s' % i,
-                                       owner='Also fake',
-                                       start_date=date)
-
-            dag.task_dict[task.task_id] = task
-
             # Schedule the DagRun
-            dag_run = scheduler.schedule_dag(dag)
-            dag_runs.append(dag_run)
+            dag_runs.append(dag.schedule_dag())
 
             # Mark the DagRun as complete
-            dag_run.state = State.SUCCESS
-            session.merge(dag_run)
-            session.commit()
+            dag_runs[-1].set_state(State.SUCCESS)
 
         # Attempt to schedule an additional dag run (for 2016-01-01)
-        additional_dag_run = scheduler.schedule_dag(dag)
+        additional_dag_run = dag.schedule_dag()
 
         for dag_run in dag_runs:
             assert dag_run is not None
 
         assert additional_dag_run is None
+
+    def test_schedule_max_active_runs(self):
+        """
+        Test that max_active_runs is respected by schedule_dag()
+        """
+        session = settings.Session()
+        start_date = DEFAULT_DATE
+        dag = DAG(TEST_DAG_ID + 'test_schedule_max_active_runs',
+                  start_date=start_date,
+                  max_active_runs=3)
+
+        # Create and schedule the dag runs
+        dag_runs = []
+        for i in range(5):
+            dr = dag.schedule_dag()
+            if dr:
+                dag_runs.append(dr)
+                session.merge(dr)
+                session.commit()
+
+        # we called schedule 5 times but there should only be 3 scheduled
+        self.assertEqual(len(dag_runs), 3)
+
+
 
     def test_confirm_unittest_mod(self):
         assert configuration.get('core', 'unit_test_mode')
@@ -483,7 +487,7 @@ class CoreTest(unittest.TestCase):
         job.run()
 
     def test_scheduler_job(self):
-        job = jobs.SchedulerJob(dag_id='example_bash_operator', test_mode=True)
+        job = jobs.SchedulerJob(dag_ids='example_bash_operator', test_mode=True)
         job.run()
 
     def test_raw_job(self):

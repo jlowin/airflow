@@ -1036,7 +1036,7 @@ class Airflow(BaseView):
         session = settings.Session()
         DR = models.DagRun
         dags = (
-            session.query(DR.dag_id, sqla.func.count(DR.id))
+            session.query(DR.dag_id, sqla.func.count(DR.execution_date))
             .filter(DR.state == State.RUNNING)
             .group_by(DR.dag_id)
             .all()
@@ -1215,7 +1215,6 @@ class Airflow(BaseView):
         for ti in tis:
             tid = alchemy_to_dict(ti)
             dr = dag_runs.get(ti.execution_date)
-            tid['external_trigger'] = dr['external_trigger'] if dr else False
             task_instances[(ti.task_id, ti.execution_date)] = tid
 
         expanded = []
@@ -1343,7 +1342,7 @@ class Airflow(BaseView):
             .order_by(desc(DR.execution_date)).all()
         )
         dr_choices = []
-        dr_state = None
+        dr_state = State.NONE
         for dr in drs:
             dr_choices.append((dr.execution_date.isoformat(), dr.run_id))
             if dttm == dr.execution_date:
@@ -2018,26 +2017,27 @@ class DagRunModelView(ModelViewOnly):
     column_editable_list = ('state',)
     verbose_name = "dag run"
     column_default_sort = ('execution_date', True)
+    form_columns=('dag_id', 'execution_date', 'state', 'lock_id',)
     form_choices = {
         'state': [
             ('success', 'success'),
-            ('running', 'running'),
             ('failed', 'failed'),
         ],
     }
     column_list = (
-        'state', 'dag_id', 'execution_date', 'run_id', 'external_trigger')
+        'state', 'dag_id', 'execution_date', 'start_date',
+        'end_date', 'lock_id')
     column_filters = column_list
-    column_searchable_list = ('dag_id', 'state', 'run_id')
+    column_searchable_list = ('dag_id', 'execution_date', 'state', 'lock_id')
     column_formatters = dict(
         execution_date=datetime_f,
         state=state_f,
         start_date=datetime_f,
         dag_id=dag_link)
 
-    @action('set_running', "Set state to 'running'", None)
-    def action_set_running(self, ids):
-        self.set_dagrun_state(ids, State.RUNNING)
+    @action('set_none', "Set state to 'none'", None)
+    def action_set_none(self, ids):
+        self.set_dagrun_state(ids, State.NONE)
 
     @action('set_failed', "Set state to 'failed'", None)
     def action_set_failed(self, ids):
@@ -2052,13 +2052,12 @@ class DagRunModelView(ModelViewOnly):
         try:
             DR = models.DagRun
             count = 0
-            for dr in session.query(DR).filter(DR.id.in_(ids)).all():
+            for i in ids:
+                dag_id, execution_date = i.split(',')
+                dr = session.query(DR).filter_by(
+                    dag_id=dag_id, execution_date=execution_date).first()
                 count += 1
-                dr.state = target_state
-                if target_state == State.RUNNING:
-                    dr.start_date = datetime.now()
-                else:
-                    dr.end_date = datetime.now()
+                dr.set_state(target_state, session=session)
             session.commit()
             flash(
                 "{count} dag runs were set to '{target_state}'".format(**locals()))
@@ -2301,9 +2300,9 @@ class DagModelView(wwwutils.SuperUserMixin, ModelView):
     column_searchable_list = ('dag_id',)
     column_filters = (
         'dag_id', 'owners', 'is_paused', 'is_active', 'is_subdag',
-        'last_scheduler_run', 'last_expired')
+        'last_scheduled', 'last_expired')
     form_widget_args = {
-        'last_scheduler_run': {'disabled': True},
+        'last_scheduled': {'disabled': True},
         'fileloc': {'disabled': True},
         'is_paused': {'disabled': True},
         'last_pickled': {'disabled': True},

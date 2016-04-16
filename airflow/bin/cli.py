@@ -117,30 +117,20 @@ def backfill(args, dag=None):
             pool=args.pool)
 
 
-def trigger_dag(args):
+def trigger_dag(args, dag=None):
+
+    dag = dag or get_dag(args)
+
     session = settings.Session()
     # TODO: verify dag_id
     execution_date = datetime.now()
-    run_id = args.run_id or "manual__{0}".format(execution_date.isoformat())
-    dr = session.query(DagRun).filter(
-        DagRun.dag_id == args.dag_id, DagRun.run_id == run_id).first()
 
-    conf = {}
+    dr = DagRun(dag_id=dag.dag_id, execution_date=datetime.now())
+
     if args.conf:
-        conf = json.loads(args.conf)
-    if dr:
-        logging.error("This run_id already exists")
-    else:
-        trigger = DagRun(
-            dag_id=args.dag_id,
-            run_id=run_id,
-            execution_date=execution_date,
-            state=State.RUNNING,
-            conf=conf,
-            external_trigger=True)
-        session.add(trigger)
-        logging.info("Created {}".format(trigger))
-    session.commit()
+        dr.set_conf(json.loads(args.conf))
+
+    logging.info("Triggered {}".format(dr))
 
 
 def variables(args):
@@ -427,7 +417,7 @@ def webserver(args):
 def scheduler(args):
     print(settings.HEADER)
     job = jobs.SchedulerJob(
-        dag_id=args.dag_id,
+        dag_ids=args.dag_id,
         subdir=process_subdir(args.subdir),
         num_runs=args.num_runs,
         do_pickle=args.do_pickle)
@@ -688,7 +678,6 @@ class CLIFactory(object):
             ("-c", "--no_confirm"),
             "Do not request confirmation", "store_true"),
         # trigger_dag
-        'run_id': Arg(("-r", "--run_id"), "Helps to indentify this run"),
         'conf': Arg(
             ('-c', '--conf'),
             "json string that gets pickled into the DagRun's conf attribute"),
@@ -840,7 +829,7 @@ class CLIFactory(object):
         }, {
             'func': trigger_dag,
             'help': "Trigger a DAG run",
-            'args': ('dag_id', 'subdir', 'run_id', 'conf'),
+            'args': ('dag_id', 'subdir', 'conf'),
         }, {
             'func': variables,
             'help': "List all variables",

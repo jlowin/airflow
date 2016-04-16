@@ -84,5 +84,7 @@ class SubDagOperator(BaseOperator):
     def execute(self, context):
         ed = context['execution_date']
         self.subdag.run(
-            start_date=ed, end_date=ed, donot_pickle=True,
+            start_date=ed,
+            end_date=ed,
+            donot_pickle=True,
             executor=self.executor)

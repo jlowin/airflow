@@ -32,7 +32,7 @@ To start a scheduler, simply run the command:
 DAG Runs
 ''''''''
 
-A DAG Run is an object representing an instantiation of the DAG in time.
+A DAG Run is an object representing an instantiation of a DAG at a specific point in time.
 
 Each DAG may or may not have a schedule, which informs how ``DAG Runs`` are
 created. ``schedule_interval`` is defined as a DAG arguments, and receives
@@ -64,13 +64,14 @@ use one of these cron "preset":
 Your DAG will be instantiated
 for each schedule, while creating a ``DAG Run`` entry for each schedule.
 
-DAG runs have a state associated to them (running, failed, success) and
+DAG runs have a state associated to them (pending, running, failed, success) and
 informs the scheduler on which set of schedules should be evaluated for
 task submissions. Without the metadata at the DAG run level, the Airflow
 scheduler would have much more work to do in order to figure out what tasks
 should be triggered and come to a crawl. It might also create undesired
 processing when changing the shape of your DAG, by say adding in new
 tasks.
+
 
 External Triggers
 '''''''''''''''''
@@ -98,4 +99,3 @@ Here are some of the ways you can **unblock tasks**:
 * The CLI command ``airflow clear -h`` has lots of options when it comes to clearing task instance states, including specifying date ranges, targeting task_ids by specifying a regular expression, flags for including upstream and downstream relatives, and targeting task instances in specific states (``failed``, or ``success``)
 * Marking task instances as successful can be done through the UI. This is mostly to fix false negatives, or for instance when the fix has been applied outside of Airflow.
 * The ``airflow backfill`` CLI subcommand has a flag to ``--mark_success`` and allows selecting subsections of the DAG as well as specifying date ranges.
-

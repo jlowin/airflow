@@ -45,7 +45,8 @@ from urllib.parse import urlparse
 from sqlalchemy import (
     Column, Integer, String, DateTime, Text, Boolean, ForeignKey, PickleType,
     Index, Float)
-from sqlalchemy import case, func, or_, and_
+from sqlalchemy import case, func, or_, and_, exists
+from sqlalchemy.sql.expression import false
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship, synonym
@@ -54,7 +55,8 @@ from croniter import croniter
 import six
 
 from airflow import settings, utils
-from airflow.executors import DEFAULT_EXECUTOR, LocalExecutor
+from airflow.executors import (
+    DEFAULT_EXECUTOR, LocalExecutor, SequentialExecutor)
 from airflow import configuration
 from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.utils.dates import cron_presets, date_range as utils_date_range
@@ -117,8 +119,7 @@ def clear_task_instances(tis, session, activate_dag_runs=True):
             DagRun.execution_date.in_(execution_dates),
         ).all()
         for dr in drs:
-            dr.state = State.RUNNING
-            dr.start_date = datetime.now()
+            dr.set_state(State.NONE)
 
 
 class DagBag(LoggingMixin):
@@ -299,9 +300,10 @@ class DagBag(LoggingMixin):
     @provide_session
     def kill_zombies(self, session):
         """
-        Fails tasks that haven't had a heartbeat in too long
+        Fails tasks that haven't had a heartbeat in too long and unlock
+        DagRuns that are locked by phantom jobs.
         """
-        from airflow.jobs import LocalTaskJob as LJ
+        from airflow.jobs import BaseJob, LocalTaskJob as LJ
         self.logger.info("Finding 'running' jobs without a recent heartbeat")
         TI = TaskInstance
         secs = (
@@ -331,6 +333,22 @@ class DagBag(LoggingMixin):
                     ti.handle_failure("{} killed as zombie".format(ti))
                     self.logger.info(
                         'Marked zombie job {} as failed'.format(ti))
+
+        self.logger.info("Finding 'locked' DagRuns without active jobs")
+        # select any DagRuns whose lock_id corresponds to a job with an end
+        # date -- the job will never unlock the DagRun.
+        dagruns = (
+            session.query(DagRun)
+            .outerjoin(BaseJob, DagRun.lock_id == BaseJob.id)
+            .filter(
+                DagRun.lock_id != None,
+                BaseJob.end_date != None)
+            .all()
+        )
+
+        for dr in dagruns:
+            dr.unlock()
+
         session.commit()
 
     def bag_dag(self, dag, parent_dag, root_dag):
@@ -418,6 +436,7 @@ class DagBag(LoggingMixin):
                 DagModel).filter(~DagModel.dag_id.in_(active_dag_ids)).all():
             dag.is_active = False
             session.merge(dag)
+            session.flush()
         session.commit()
         session.close()
 
@@ -755,11 +774,11 @@ class TaskInstance(Base):
             TI.dag_id == self.dag_id,
             TI.task_id == self.task_id,
             TI.execution_date == self.execution_date,
-        ).all()
+        ).first()
         if ti:
-            state = ti[0].state
+            state = ti.state
         else:
-            state = None
+            state = State.NONE
         return state
 
     @provide_session
@@ -789,7 +808,7 @@ class TaskInstance(Base):
             self.end_date = ti.end_date
             self.try_number = ti.try_number
         else:
-            self.state = None
+            self.state = State.NONE
 
     @provide_session
     def clear_xcom_data(self, session=None):
@@ -1328,7 +1347,6 @@ class TaskInstance(Base):
         ti_key_str = ti_key_str.format(**locals())
 
         params = {}
-        run_id = ''
         dag_run = None
         if hasattr(task, 'dag'):
             if task.dag.params:
@@ -1340,7 +1358,6 @@ class TaskInstance(Base):
                     execution_date=self.execution_date)
                 .first()
             )
-            run_id = dag_run.run_id if dag_run else None
             session.expunge_all()
             session.commit()
 
@@ -1360,7 +1377,6 @@ class TaskInstance(Base):
             'END_DATE': ds,
             'end_date': ds,
             'dag_run': dag_run,
-            'run_id': run_id,
             'execution_date': self.execution_date,
             'latest_date': ds,
             'macros': macros,
@@ -2275,8 +2291,8 @@ class DagModel(Base):
     is_subdag = Column(Boolean, default=False)
     # Whether that DAG was seen on the last DagBag load
     is_active = Column(Boolean, default=False)
-    # Last time the scheduler started
-    last_scheduler_run = Column(DateTime)
+    # Last time the a dagrun was scheduled
+    last_scheduled = Column(DateTime)
     # Last time this DAG was pickled
     last_pickled = Column(DateTime)
     # When the DAG received a refreshed signal last, used to know when
@@ -2467,9 +2483,13 @@ class DAG(LoggingMixin):
 
     # /Context Manager ----------------------------------------------
 
-    def date_range(self, start_date, num=None, end_date=datetime.now()):
+    def date_range(self, start_date, num=None, end_date=None):
+
         if num:
             end_date = None
+        elif end_date is None:
+            end_date = datetime.now()
+
         return utils_date_range(
             start_date=start_date, end_date=end_date,
             num=num, delta=self._schedule_interval)
@@ -2487,6 +2507,242 @@ class DAG(LoggingMixin):
             return cron.get_prev(datetime)
         elif isinstance(self._schedule_interval, timedelta):
             return dttm - self._schedule_interval
+
+    def on_schedule(self, dttm):
+        """
+        Returns True if dttm is a scheduled datetime for the DAG, False if not
+        """
+        # TODO write tests
+        if not self._schedule_interval:
+            return False
+
+        if self.start_date:
+            start_date = self.start_date
+        else:
+            if any(t.start_date for t in self.tasks):
+                start_date = min(t.start_date for t in self.tasks)
+            else:
+                return False
+
+        return (dttm - start_date) % self._schedule_interval == timedelta(0)
+
+    @provide_session
+    def schedule_dag(self, last_scheduled=None, session=None):
+        """
+        This method examines a given DAG and determines if a new
+        DagRun can be created, based on the DAG's schedule and number
+        of active runs. The DagRun is returned if it is created,
+        otherwise None is returned.
+
+        :param last_scheduled: if provided, used as the last scheduled run date
+        :type last_scheduled: datetime
+        """
+        if self.schedule_interval:
+
+            num_runs = (
+                session.query(DagRun)
+                    .filter(
+                        DagRun.dag_id == self.dag_id,
+                        DagRun.state == State.RUNNING)
+                    .count())
+            if self.max_active_runs and num_runs >= self.max_active_runs:
+                return
+
+            if not last_scheduled:
+                last_scheduled = (
+                    session.query(DagModel.last_scheduled)
+                        .filter_by(dag_id=self.dag_id)
+                        .scalar())
+
+            # if the DAG is not in the database, use its attribute
+            if not last_scheduled:
+                last_scheduled = getattr(self, 'last_scheduled', None)
+            next_run_date = None
+
+            # if the DAG should be run once, but has never run, run it
+            if self.schedule_interval == '@once' and not last_scheduled:
+                next_run_date = datetime.now()
+
+            # if the DAG has never been scheduled...
+            elif not last_scheduled:
+
+                # the first date is the start_date
+                if self.start_date and self.start_date <= datetime.now():
+                    next_run_date = self.start_date
+                elif not self.start_date:
+                    if any(t.start_date for t in self.tasks):
+                        next_run_date = min(t.start_date for t in self.tasks)
+
+            # if it has been scheduled and has an interval, ask for the next dt
+            elif self.schedule_interval != '@once':
+                next_run_date = self.following_schedule(last_scheduled)
+
+            # don't ever schedule prior to the self's start_date
+            if self.start_date:
+                next_run_date = (
+                    self.start_date
+                    if not next_run_date
+                    else max(next_run_date, self.start_date))
+
+            if self.schedule_interval == '@once':
+                schedule_end = next_run_date
+            elif next_run_date:
+                schedule_end = self.following_schedule(next_run_date)
+
+            # if the next run date is after the DAG's end_date, do nothing
+            if (
+                    next_run_date and self.end_date and
+                    next_run_date > self.end_date):
+                return
+
+            # if there is a next run date and we've passed the schedule_end
+            # then create a DagRun and update the last_scheduled
+            if (
+                    next_run_date and schedule_end and
+                    schedule_end <= datetime.now()):
+
+
+                self.last_scheduled = next_run_date
+                (
+                    session.query(DagModel)
+                        .filter_by(dag_id=self.dag_id)
+                        .update({DagModel.last_scheduled: next_run_date}))
+
+                dr = DagRun(dag_id=self.dag_id, execution_date=next_run_date)
+                dr.refresh_from_db()
+
+                session.merge(dr)
+                session.commit()
+                return dr
+
+
+    @provide_session
+    def update_dagrun_states(self, session=None):
+        """
+        Updates DAGRUN states based on the performance of constituent tasks.
+
+
+        The following transitions are checked:
+            - [NONE] dagruns:
+                - RUN if self.max_active_runs hasn't been reached
+            - RUNNING dagruns:
+                - SUCCEED if all root tasks succeed/skip
+                - FAIL if self.dagrun_timeout is reached
+                - FAIL if any root tasks failed
+                - FAIL if they deadlock and don't have any depends_on_past=True
+                - FAIL if *all* of the dag's runs are deadlocked
+                - Have `end_date` set if they fail/succeed
+            - OTHER dagruns:
+                - no change
+        """
+        dagruns = (
+            session.query(DagRun)
+            .filter(
+                DagRun.dag_id == self.dag_id,
+                or_(
+                    DagRun.state == State.RUNNING,
+                    DagRun.state == None))
+            .all())
+
+        active_tis = []
+        for run in dagruns:
+            if run.state == State.RUNNING:
+                for task in self.tasks:
+                    ti = TaskInstance(task, run.execution_date)
+                    ti.refresh_from_db()
+                    active_tis.append(ti)
+
+        for run in sorted(dagruns):
+
+            logging.debug("Checking DagRun state: {}".format(run))
+
+            run.refresh_from_db()
+
+            num_active = (
+                session.query(DagRun).filter_by(
+                    dag_id=self.dag_id, state=State.RUNNING)
+                .count())
+
+            # --- PENDING [NONE]
+            if run.state == State.NONE:
+                if num_active < self.max_active_runs:
+                    run.set_state(State.RUNNING, session=session)
+
+            # --- RUNNING
+            elif run.state == State.RUNNING:
+                tis = [
+                    t for t in active_tis
+                    if t.execution_date == run.execution_date]
+
+                root_tis = [t for t in tis if t.task in self.roots]
+
+                # --- TIMEOUT
+                # if the run is taking too long, it failed
+                if (
+                        run.start_date and
+                        self.dagrun_timeout and
+                        run.start_date < datetime.now() - self.dagrun_timeout):
+                    logging.debug(
+                        'DagRun timed out; marking run {} failed'.format(run))
+
+                    run.set_state(State.FAILED, session=session)
+
+                # --- NOT STARTED
+                elif not tis:
+                    pass
+
+                # --- FAILED
+                # if any roots failed, the run failed
+                elif any(
+                        r.state in (State.FAILED,  State.UPSTREAM_FAILED)
+                        for r in root_tis):
+                    logging.debug(
+                        'Some root tasks failed; marking '
+                        'run {} failed'.format(run))
+                    run.set_state(State.FAILED, session=session)
+
+                # --- SUCCESS
+                # if all roots succeeded, the run succeeded
+                elif all(
+                        r.state in (State.SUCCESS, State.SKIPPED)
+                        for r in root_tis):
+                    logging.debug(
+                        'All root tasks succeeded; '
+                        'marking run {} successful'.format(run))
+                    run.set_state(State.SUCCESS, session=session)
+
+                # --- DEADLOCK
+                elif (
+                        # check if there are unfinished tasks
+                        any(t.state in State.unfinished() for t in tis) and
+                        # AND if none of their dependencies are met
+                        all(not t.are_dependencies_met(session=session)
+                            for t in tis if t.state in State.unfinished()) and
+                        # AND none of the tasks depend on past
+                        all(not t.task.depends_on_past for t in tis
+                            if t.state in State.unfinished())):
+                    # then we can fail it
+                    logging.debug(
+                        'DagRun deadlocked; marking '
+                        'run {} failed'.format(run))
+                    run.set_state(State.FAILED, session=session)
+
+                # If ALL of the TIs in ALL of the DAG's active dagruns are
+                # unable to run, then all of those dagruns are deadlocked
+                # and should be marked as failed
+                elif all(
+                        not t.are_dependencies_met(session=session)
+                        for t in active_tis):
+                    logging.debug(
+                        'All active DagRuns for DAG {} are deadlocked; '
+                        'marking them as FAILED'.format(self.dag_id))
+                    deadlocked_dagruns = (
+                        session.query(DagRun)
+                        .filter(
+                            DagRun.dag_id == self.dag_id,
+                            DagRun.state == State.RUNNING))
+                    for dr in deadlocked_dagruns:
+                        dr.set_state(State.FAILED, session=session)
 
     @property
     def tasks(self):
@@ -2585,107 +2841,6 @@ class DAG(LoggingMixin):
                 l += task.subdag.subdags
         return l
 
-    def get_active_runs(self):
-        """
-        Maintains and returns the currently active runs as a list of dates.
-
-        A run is considered a SUCCESS if all of its root tasks either succeeded
-        or were skipped.
-
-        A run is considered a FAILURE if any of its root tasks failed OR if
-        it is deadlocked, meaning no tasks can run.
-        """
-        TI = TaskInstance
-        session = settings.Session()
-        active_dates = []
-        active_runs = (
-            session.query(DagRun)
-            .filter(
-                DagRun.dag_id == self.dag_id,
-                DagRun.state == State.RUNNING)
-            .order_by(DagRun.execution_date)
-            .all())
-
-        task_instances = (
-            session
-            .query(TI)
-            .filter(
-                TI.dag_id == self.dag_id,
-                TI.task_id.in_(self.active_task_ids),
-                TI.execution_date.in_(r.execution_date for r in active_runs)
-            )
-            .all())
-
-        for ti in task_instances:
-            ti.task = self.get_task(ti.task_id)
-
-        # Runs are considered deadlocked if there are unfinished tasks but
-        # none of them can run. First we check across *all* dagruns in case
-        # there are depends_on_past relationships which could make individual
-        # dags look deadlocked incorrectly. Later we will check individual
-        # dagruns, as long as they don't have depends_on_past=True
-        all_deadlocked = (
-            # AND there are unfinished tasks...
-            any(ti.state in State.unfinished() for ti in task_instances) and
-            # AND none of them have dependencies met...
-            all(not ti.are_dependencies_met(session=session)
-                for ti in task_instances
-                if ti.state in State.unfinished()))
-
-        for run in active_runs:
-            self.logger.info("Checking state for {}".format(run))
-
-            tis = [
-                t for t in task_instances
-                if t.execution_date == run.execution_date
-            ]
-
-            if len(tis) == len(self.active_tasks):
-
-                # if any roots failed, the run failed
-                root_ids = [t.task_id for t in self.roots]
-                roots = [t for t in tis if t.task_id in root_ids]
-                if any(
-                        r.state in (State.FAILED,  State.UPSTREAM_FAILED)
-                        for r in roots):
-                    self.logger.info('Marking run {} failed'.format(run))
-                    run.state = State.FAILED
-
-                # if all roots succeeded, the run succeeded
-                elif all(
-                        r.state in (State.SUCCESS, State.SKIPPED)
-                        for r in roots):
-                    self.logger.info('Marking run {} successful'.format(run))
-                    run.state = State.SUCCESS
-
-                # if *the individual dagrun* is deadlocked, the run failed
-                elif (
-                        # there are unfinished tasks
-                        any(t.state in State.unfinished() for t in tis) and
-                        # AND none of them depend on past
-                        all(not t.task.depends_on_past for t in tis
-                            if t.state in State.unfinished()) and
-                        # AND none of their dependencies are met
-                        all(not t.are_dependencies_met() for t in tis
-                            if t.state in State.unfinished())):
-                    self.logger.info(
-                        'Deadlock; marking run {} failed'.format(run))
-                    run.state = State.FAILED
-
-                # if *ALL* dagruns are deadlocked, the run failed
-                elif all_deadlocked:
-                    self.logger.info(
-                        'Deadlock; marking run {} failed'.format(run))
-                    run.state = State.FAILED
-
-                # finally, if the roots aren't done, the dag is still running
-                else:
-                    active_dates.append(run.execution_date)
-            else:
-                active_dates.append(run.execution_date)
-        session.commit()
-        return active_dates
-
     def resolve_template_files(self):
         for t in self.tasks:
             t.resolve_template_files()
@@ -2746,14 +2901,6 @@ class DAG(LoggingMixin):
     def roots(self):
         return [t for t in self.tasks if not t.downstream_list]
 
-    @provide_session
-    def set_dag_runs_state(
-            self, start_date, end_date, state=State.RUNNING, session=None):
-        dates = utils_date_range(start_date, end_date)
-        drs = session.query(DagModel).filter_by(dag_id=self.dag_id).all()
-        for dr in drs:
-            dr.state = State.RUNNING
-
     def clear(
             self, start_date=None, end_date=None,
             only_failed=False,
@@ -2762,11 +2909,11 @@ class DAG(LoggingMixin):
             include_subdags=True,
             reset_dag_runs=True,
             dry_run=False):
-        session = settings.Session()
         """
         Clears a set of task instances associated with the current dag for
         a specified date range.
         """
+        session = settings.Session()
         TI = TaskInstance
         tis = session.query(TI)
         if include_subdags:
@@ -2797,9 +2944,6 @@ class DAG(LoggingMixin):
 
         count = tis.count()
         do_it = True
-        if count == 0:
-            print("Nothing to clear.")
-            return 0
         if confirm_prompt:
             ti_list = "\n".join([str(t) for t in tis])
             question = (
@@ -2809,12 +2953,20 @@ class DAG(LoggingMixin):
             do_it = utils.helpers.ask_yesno(question)
 
         if do_it:
-            clear_task_instances(tis, session)
+            if count > 0:
+                clear_task_instances(tis, session)
             if reset_dag_runs:
-                self.set_dag_runs_state(start_date, end_date, session=session)
+                drs = session.query(DagRun).filter(DagRun.dag_id==self.dag_id)
+                if start_date:
+                    drs = drs.filter(DagRun.execution_date >= start_date)
+                if end_date:
+                    drs = drs.filter(DagRun.execution_date <= end_date)
+                for dr in drs:
+                    dr.set_state(State.NONE, session=session)
+
         else:
             count = 0
-            print("Bail. Nothing was cleared.")
+            print('Nothing was cleared.')
 
         session.commit()
         session.close()
@@ -3260,6 +3412,7 @@ class XCom(Base):
         session.commit()
 
 
+@functools.total_ordering
 class DagRun(Base):
     """
     DagRun describes an instance of a Dag. It can be created
@@ -3267,36 +3420,350 @@ class DagRun(Base):
     """
     __tablename__ = "dag_run"
 
-    ID_PREFIX = 'scheduled__'
-    ID_FORMAT_PREFIX = ID_PREFIX + '{0}'
-
-    id = Column(Integer, primary_key=True)
-    dag_id = Column(String(ID_LEN))
-    execution_date = Column(DateTime, default=func.now())
+    dag_id = Column(String(ID_LEN), primary_key=True)
+    execution_date = Column(DateTime, default=func.now(), primary_key=True)
     start_date = Column(DateTime, default=func.now())
     end_date = Column(DateTime)
-    state = Column(String(50), default=State.RUNNING)
-    run_id = Column(String(ID_LEN))
-    external_trigger = Column(Boolean, default=True)
+    state = Column(String(50))
     conf = Column(PickleType)
+    lock_id = Column(Integer)
 
     __table_args__ = (
-        Index('dr_run_id', dag_id, run_id, unique=True),
+        Index('dr_dag_date', dag_id, execution_date, unique=True),
     )
 
-    def __repr__(self):
-        return (
-            '<DagRun {dag_id} @ {execution_date}: {run_id}, '
-            'externally triggered: {external_trigger}>'
-        ).format(
-            dag_id=self.dag_id,
-            execution_date=self.execution_date,
-            run_id=self.run_id,
-            external_trigger=self.external_trigger)
+    def __init__(self, dag_id, execution_date):
+        """
+        :param dag_id: the dag_id for this DagRun
+        :type dag_id: string
+        :param execution_date: the execution_date for this DagRun
+        :type execution_date: datetime
+        """
+        self.execution_date = execution_date
+        self.dag_id = dag_id
+        self.refresh_from_db()
 
-    @classmethod
-    def id_for_date(klass, date, prefix=ID_FORMAT_PREFIX):
-        return prefix.format(date.isoformat()[:19])
+    @property
+    def run_id(self):
+        return (
+            '<DagRun {dr.dag_id} @ {dr.execution_date} '
+            '[{dr.state}{lock}]>'.format(
+                dr=self, lock=' (locked)' if self.locked else ''))
+
+    def __repr__(self):
+        return self.run_id
+
+    def __eq__(self, other):
+        return (
+            (self.dag_id, self.execution_date) ==
+            (other.dag_id, other.execution_date))
+
+    def __lt__(self, other):
+        return (
+            (self.dag_id, self.execution_date) <
+            (other.dag_id, other.execution_date))
+
+    def __hash__(self):
+        return hash((self.dag_id, self.execution_date))
+
+    @provide_session
+    def refresh_from_db(self, session=None):
+        """
+        Refreshes the dagrun from the database
+        """
+        dr = self._db_query().first()
+        if dr:
+            self.start_date = dr.start_date
+            self.end_date = dr.end_date
+            self.state = dr.state
+            self.conf = dr.conf
+            self.lock_id = dr.lock_id
+
+    @provide_session
+    def set_state(self, state, session=None):
+        """
+        Sets the DagRun's state.
+
+        In addition to setting 'state', the following transitions are observed:
+
+            - any state -> NONE
+                - clear start_date
+                - clear end_date
+
+            - not RUNNING -> RUNNING
+                - set start_date (now)
+                - clear end_date
+
+            - any state -> (SUCCESS, FAILED)
+                - set end_date (now)
+
+
+        """
+        if not self._db_exists():
+            session.add(self)
+            session.commit()
+
+        db_state = self._db_query(DagRun.state).scalar()
+        self.state = state
+
+        # if we're setting NONE, reset start/end dates
+        if state == State.NONE:
+            self.start_date = None
+            self.end_date = None
+            self._db_query().update({
+                DagRun.state: self.state,
+                DagRun.start_date: self.start_date,
+                DagRun.end_date: self.end_date
+                })
+
+        # if we're running, reset start/end dates
+        elif db_state != State.RUNNING and state == State.RUNNING:
+            self.start_date = datetime.now()
+            self.end_date = None
+            self._db_query().update({
+                DagRun.state: self.state,
+                DagRun.start_date: self.start_date,
+                DagRun.end_date: self.end_date
+                })
+
+        # if we're ending, set end_date
+        elif state in (State.SUCCESS, State.FAILED):
+            self.end_date = datetime.now()
+            self._db_query().update({
+                DagRun.state: self.state,
+                DagRun.end_date: self.end_date
+                })
+
+        # raise an error for other unrecognized states
+        else:
+            raise AirflowException('Unrecognized state: {}'.format(state))
+
+        session.commit()
+
+    @property
+    def locked(self):
+        return self.lock_id is not None
+
+    @provide_session
+    def lock(self, lock_id=-1, session=None):
+        """
+        Locks the DagRun to indicate that the DagRun is currently executing
+        """
+        if not self._db_exists():
+            session.add(self)
+            session.commit()
+
+        if self._db_query(DagRun.lock_id).scalar() not in (None, lock_id):
+            raise AirflowException(
+                'DagRun {} is already locked by another process.'.format(self))
+
+        self.lock_id = lock_id
+        # do this instead of full merge in case other properties are not synced
+        self._db_query().update({DagRun.lock_id: self.lock_id})
+        session.commit()
+
+    @provide_session
+    def unlock(self, session=None):
+        """
+        Unlocks the DagRun to indicate that the DagRun is not currently
+        executing
+        """
+        orm_dagrun = self._db_query().first()
+        if not orm_dagrun:
+            session.add(self)
+            session.commit()
+        self.lock_id = None
+        # do this instead of full merge in case other properties are not synced
+        self._db_query().update({DagRun.lock_id: self.lock_id})
+        session.commit()
+
+    @provide_session
+    def set_conf(self, conf, session=None):
+        """
+        Sets the `conf` attribute for this DagRun and stores it in the database.
+        """
+        if not self._db_exists():
+            session.add(self)
+            session.commit()
+
+        if self._db_query(DagRun.lock_id).scalar():
+            raise AirflowException('DagRun {} is locked.'.format(self))
+        self.conf = conf
+        # do this instead of full merge in case other properties are not synced
+        self._db_query().update({DagRun.conf: self.conf})
+        session.commit()
+
+    @provide_session
+    def _db_exists(self, session=None):
+        """
+        Returns True if this DagRun exists in the database.
+        That does not mean that this DagRun object is up to date
+        with the database, however.
+        """
+        return (
+            session.query(
+                exists()
+                .where(and_(
+                    DagRun.dag_id == self.dag_id,
+                    DagRun.execution_date == self.execution_date)))
+            .scalar())
+
+    @provide_session
+    def _db_query(self, cols=None, session=None):
+        """
+        Convenient way to query the database version of this dagrun.
+        """
+        if cols is None:
+            cols = DagRun
+        return session.query(cols).filter_by(
+            dag_id=self.dag_id, execution_date=self.execution_date)
+
+    @provide_session
+    def run(
+            self,
+            dagbag=None,
+            executor=None,
+            run_queued_tasks=True,
+            do_pickle=False,
+            include_adhoc=False,
+            ignore_depends_on_past=False,
+            ignore_dependencies=False,
+            mark_success=False,
+            pool=None,
+            session=None):
+        """
+        Runs the DagRun.
+
+        This will load all the tasks in the DAG and, if they are runnable,
+        pass them to the Executor. A dict containing progress information
+        is returned.
+
+        Note that calling this method is NOT equivalent to running a DAG.
+        This method submits "open" tasks to an executor. It does not check
+        for output and does not handle QUEUED tasks.
+
+        :param dagbag: a dagbag from which to load the Dag. If None, a default
+            dagbag that searches DAGS_FOLDER will be used
+        :type dagbag: DagBag
+        :param executor: the executor. If None, DEFAULT_EXECUTOR is used.
+        :type executor: Executor
+        :param run_queued_tasks: if True, queued tasks are sent to the executor.
+            When multiple DagRuns are being run by a job (like DagRunJob,
+            SchedulerJob, or BackfillJob), the job will manage queued tasks
+            based on priority across all jobs.
+        :type run_queued_tasks: boolean
+        """
+
+        queued = set()
+        could_not_run = set()
+        started = set()
+
+        if dagbag is None:
+            dagbag = DagBag()
+        if executor is None:
+            executor = DEFAULT_EXECUTOR
+
+        dag = dagbag.dags.get(self.dag_id, None)
+        if not dag:
+            raise AirflowException(
+                'DAG {} not found in dagbag'.format(self.dag_id))
+
+        # pickling
+        pickle_id = None
+        if do_pickle and executor.__class__ not in (
+                LocalExecutor, SequentialExecutor):
+            pickle_id = dag.pickle(session).id
+
+        finished = set(
+            session.query(TaskInstance)
+            .filter(
+                TaskInstance.dag_id == self.dag_id,
+                TaskInstance.execution_date == self.execution_date,
+                TaskInstance.state.in_(State.finished()))
+            .all())
+
+        finished_ids = [t.task_id for t in finished]
+        for task in dag.tasks:
+            if task.task_id in finished_ids:
+                continue
+
+            ti = TaskInstance(task, self.execution_date)
+
+            if not include_adhoc and task.adhoc:
+                finished_ids.add(task.task_id)
+                finished.add(ti)
+                continue
+
+            ti.refresh_from_db()
+
+            if ti.state in State.finished():
+                finished.add(ti)
+            elif not run_queued_tasks and ti.state == State.QUEUED:
+                queued.add(ti)
+            elif ti.is_queueable(
+                    include_queued=run_queued_tasks,
+                    flag_upstream_failed=True,
+                    ignore_depends_on_past=ignore_depends_on_past):
+                logging.debug('Firing task: {}'.format(ti))
+                executor.queue_task_instance(
+                    ti,
+                    pickle_id=pickle_id,
+                    ignore_depends_on_past=ignore_depends_on_past,
+                    ignore_dependencies=ignore_dependencies,
+                    mark_success=mark_success,
+                    pool=pool)
+                started.add(ti)
+            else:
+                could_not_run.add(ti)
+
+        status = dict(
+            total_tasks=len(dag.tasks),
+            finished=len(finished),
+            succeeded=len([t for t in finished if t.state == State.SUCCESS]),
+            failed=len([t for t in finished if t.state == State.FAILED]),
+            skipped=len([t for t in finished if t.state == State.SKIPPED]),
+            deadlocked=(
+                bool(could_not_run) and len(could_not_run) == len(dag.tasks)),
+            could_not_run=len(could_not_run),
+            started=len(started),
+            queued=len(queued),
+        )
+
+        return status
+
+
+@provide_session
+def clear_dagrun(dagrun, clear_tis=True, session=None):
+    """
+    Deletes a DagRun and all associated TaskInstances
+    """
+    if dagrun.lock:
+        raise AirflowException(
+            "Can't clear a locked DagRun: {}".format(dagrun))
+
+    if clear_tis:
+        # delete TIs
+        (session.query(TaskInstance)
+            .filter(
+                TaskInstance.dag_id == dagrun.dag_id,
+                TaskInstace.execution_date == dagrun.execution_date)
+            .delete())
+
+        # delete XComs
+        (session.query(XCom)
+            .filter(
+                XCom.dag_id == dagrun.dag_id,
+                XCom.execution_date == dagrun.execution_date)
+            .delete())
+
+    # delete DagRun
+    (session.query(DagRun)
+        .filer(
+            DagRun.dag_id == dagrun.dag_id,
+            DagRun.execution_date == dagrun.execution_date)
+        .delete())
+
+    session.commit()
 
 
 class Pool(Base):
@@ -3373,3 +3840,12 @@ class ImportError(Base):
     timestamp = Column(DateTime)
     filename = Column(String(1024))
     stacktrace = Column(Text)
+
+
+class Numbers(Base):
+    """
+    A utility table that provides a range of numbers from 1-1000
+    """
+    __tablename__ = "numbers"
+
+    id = Column(Integer, primary_key=True)
