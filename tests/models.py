@@ -22,9 +22,9 @@ import os
 import unittest
 import time
 
-from airflow import models, AirflowException
+from airflow import models, AirflowException, settings
 from airflow.exceptions import AirflowSkipException
-from airflow.models import DAG, DagBag, DagRun, DagModel, TaskInstance as TI
+from airflow.models import DAG, DagBag, DagRun, DagModel, TaskInstance
 from airflow.models import State as ST
 from airflow.operators import DummyOperator, BashOperator, PythonOperator
 from airflow.utils.state import State
@@ -35,9 +35,16 @@ from nose_parameterized import parameterized
 DEFAULT_DATE = datetime.datetime(2016, 1, 1)
 TEST_DAGS_FOLDER = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), 'dags')
+TI = TaskInstance
 
 
 class DagTest(unittest.TestCase):
+
+    def tearDown(self):
+        session = settings.Session()
+        session.query(DagRun).delete()
+        session.query(TaskInstance).delete()
+        session.commit()
 
     def test_parms_not_passed_is_empty_dict(self):
         """
@@ -116,6 +123,12 @@ class DagTest(unittest.TestCase):
 
 class DagRunTest(unittest.TestCase):
 
+    def tearDown(self):
+        session = settings.Session()
+        session.query(DagRun).delete()
+        session.query(TaskInstance).delete()
+        session.commit()
+
     def test_comparison(self):
         """
         Test DagRun ==, >, and hashing ops
@@ -181,22 +194,12 @@ class DagRunTest(unittest.TestCase):
         d2.refresh_from_db()
         self.assertEqual((d1.conf, d2.conf), (1, 1))
 
-    def test_initial_state(self):
-        """
-        Test that DagRuns start in PENDING state
-        """
-        d1 = DagRun('dag', DEFAULT_DATE)
-        # db object gets default state: PENDING
-        self.assertEqual(d1.state, ST.PENDING)
-        d1.refresh_from_db()
-        self.assertEqual(d1.state, ST.PENDING)
-
     def test_update_state(self):
         """
         Test state modification
         """
         d1 = DagRun('dag', DEFAULT_DATE)
-        self.assertEqual(d1.state, ST.PENDING)
+        self.assertEqual(d1.state, None)
         self.assertIs(d1.start_date, None)
         self.assertIs(d1.end_date, None)
 
@@ -212,9 +215,9 @@ class DagRunTest(unittest.TestCase):
         self.assertEqual(d1.start_date, sd)
         self.assertIsNot(d1.end_date, None)
 
-        # back to PENDING, should reset
-        d1.set_state(ST.PENDING)
-        self.assertEqual(d1.state, ST.PENDING)
+        # back to NONE, should reset
+        d1.set_state(ST.NONE)
+        self.assertEqual(d1.state, ST.NONE)
         self.assertIs(d1.start_date, None)
         self.assertIs(d1.end_date, None)
 
@@ -243,6 +246,7 @@ class DagRunTest(unittest.TestCase):
             run_kwargs = {}
 
         dag = DagBag().get_dag(dag_id)
+
         dag.clear()
         if advance_execution_date:
             # run a second time to schedule a dagrun after the start_date

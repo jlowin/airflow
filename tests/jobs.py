@@ -25,7 +25,7 @@ import airflow
 from airflow import AirflowException, settings
 from airflow.bin import cli
 from airflow.jobs import BaseJob, DagRunJob, BackfillJob, SchedulerJob
-from airflow.models import DagBag, DagRun, Pool, TaskInstance as TI
+from airflow.models import DagBag, DagRun, Pool, TaskInstance
 from airflow.utils.state import State
 from airflow.utils.timeout import timeout
 from airflow.utils.db import provide_session
@@ -37,6 +37,7 @@ configuration.test_mode()
 
 DEV_NULL = '/dev/null'
 DEFAULT_DATE = datetime.datetime(2016, 1, 1)
+TI = TaskInstance
 
 class DagRunJobTest(unittest.TestCase):
 
@@ -46,6 +47,12 @@ class DagRunJobTest(unittest.TestCase):
         self.job.dagbag = DagBag(include_examples=True)
         self.job.executor = self.job.dagbag.executor
         self.dag = self.job.dagbag.dags['example_bash_operator']
+
+    def tearDown(self):
+        session = settings.Session()
+        session.query(DagRun).delete()
+        session.query(TaskInstance).delete()
+        session.commit()
 
     def test_kill_zombie_dagruns(self):
         dr = DagRun(self.dag.dag_id, DEFAULT_DATE)
@@ -70,11 +77,16 @@ class BackfillJobTest(unittest.TestCase):
         self.parser = cli.CLIFactory.get_parser()
         self.dagbag = DagBag(include_examples=True)
 
+    def tearDown(self):
+        session = settings.Session()
+        session.query(DagRun).delete()
+        session.query(TaskInstance).delete()
+        session.commit()
+
     def test_backfill_examples(self):
         """
         Test backfilling example dags
         """
-        1/0
         # some DAGs really are just examples... but try to make them work!
         skip_dags = [
             'example_http_operator',
@@ -140,11 +152,15 @@ class BackfillJobTest(unittest.TestCase):
         dag.clear()
         run_date = DEFAULT_DATE + datetime.timedelta(days=5)
 
-        # backfill should deadlock
-        self.assertRaisesRegexp(
-            AirflowException,
-            'BackfillJob is deadlocked',
-            BackfillJob(dag=dag, start_date=run_date, end_date=run_date).run)
+        BackfillJob(
+            dag=dag,
+            start_date=run_date,
+            end_date=run_date).run()
+
+        # ti won't have run
+        ti = TI(dag.tasks[0], run_date)
+        ti.refresh_from_db()
+        self.assertEquals(ti.state, State.NONE)
 
         BackfillJob(
             dag=dag,
@@ -189,6 +205,12 @@ class BackfillJobTest(unittest.TestCase):
 
 
 class SchedulerJobTest(unittest.TestCase):
+
+    def tearDown(self):
+        session = settings.Session()
+        session.query(DagRun).delete()
+        session.query(TaskInstance).delete()
+        session.commit()
 
     def test_scheduler_pooled_tasks(self):
         """

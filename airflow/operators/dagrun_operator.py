@@ -56,7 +56,8 @@ class TriggerDagRunOperator(BaseOperator):
                 execution_date=execution_date)
             dr.set_conf(dro.payload)
             logging.info("Creating DagRun {}".format(dr))
-            session.add(dr)
+            dr.refresh_from_db()
+            session.merge(dr)
             session.commit()
             session.close()
         else:

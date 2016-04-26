@@ -17,7 +17,7 @@ import os
 import unittest
 
 import airflow
-from airflow.models import DAG, DagBag
+from airflow.models import DAG, DagBag, DagRun
 from airflow.operators import BashOperator, DummyOperator, SubDagOperator
 from airflow.jobs import BackfillJob
 from airflow.exceptions import AirflowException
@@ -30,6 +30,11 @@ default_args = dict(
 )
 
 class SubDagOperatorTests(unittest.TestCase):
+
+    def tearDown(self):
+        session = airflow.settings.Session()
+        session.query(DagRun).delete()
+        session.commit()
 
     def test_subdag_name(self):
         """
@@ -88,9 +93,6 @@ class SubDagOperatorTests(unittest.TestCase):
         dag.clear()
         subdag = dagbag.get_dag('test_subdag_deadlock.subdag')
         subdag.clear()
-
-        # first make sure subdag is deadlocked
-        self.assertRaisesRegexp(AirflowException, 'deadlocked', subdag.run, start_date=DEFAULT_DATE, end_date=DEFAULT_DATE)
 
         # now make sure dag picks up the subdag error
         subdag.clear()

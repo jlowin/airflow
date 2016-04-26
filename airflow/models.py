@@ -2617,7 +2617,11 @@ class DAG(LoggingMixin):
 
 
     @provide_session
-    def update_dagrun_states(self, session=None):
+    def update_dagrun_states(
+            self,
+            ignore_depends_on_past_dates=None,
+            flag_upstream_failed=True,
+            session=None):
         """
         Updates DAGRUN states based on the performance of constituent tasks.
 
@@ -2635,6 +2639,9 @@ class DAG(LoggingMixin):
             - OTHER dagruns:
                 - no change
         """
+        if ignore_depends_on_past_dates is None:
+            ignore_depends_on_past_dates = {}
+
         dagruns = (
             session.query(DagRun)
             .filter(
@@ -2658,13 +2665,13 @@ class DAG(LoggingMixin):
 
             run.refresh_from_db()
 
-            num_active = (
-                session.query(DagRun).filter_by(
-                    dag_id=self.dag_id, state=State.RUNNING)
-                .count())
-
             # --- PENDING [NONE]
             if run.state == State.NONE:
+                num_active = (
+                    session.query(DagRun).filter_by(
+                        dag_id=self.dag_id, state=State.RUNNING)
+                    .count())
+
                 if num_active < self.max_active_runs:
                     run.set_state(State.RUNNING, session=session)
 
@@ -2675,6 +2682,9 @@ class DAG(LoggingMixin):
                     if t.execution_date == run.execution_date]
 
                 root_tis = [t for t in tis if t.task in self.roots]
+
+                for t in tis:
+                    t.refresh_from_db()
 
                 # --- TIMEOUT
                 # if the run is taking too long, it failed
@@ -2731,7 +2741,11 @@ class DAG(LoggingMixin):
                 # unable to run, then all of those dagruns are deadlocked
                 # and should be marked as failed
                 elif all(
-                        not t.are_dependencies_met(session=session)
+                        not t.are_dependencies_met(
+                            session=session,
+                            ignore_depends_on_past=(
+                                ignore_depends_on_past_dates.get(run.dag_id) ==
+                                    run.execution_date))
                         for t in active_tis):
                     logging.debug(
                         'All active DagRuns for DAG {} are deadlocked; '
@@ -3467,6 +3481,11 @@ class DagRun(Base):
         return hash((self.dag_id, self.execution_date))
 
     @provide_session
+    def delete_from_db(self, session=None):
+        self._db_query(session=session).delete()
+        session.commit()
+
+    @provide_session
     def refresh_from_db(self, session=None):
         """
         Refreshes the dagrun from the database
@@ -3500,7 +3519,7 @@ class DagRun(Base):
 
         """
         if not self._db_exists():
-            session.add(self)
+            session.merge(self)
             session.commit()
 
         db_state = self._db_query(DagRun.state).scalar()
@@ -3550,7 +3569,7 @@ class DagRun(Base):
         Locks the DagRun to indicate that the DagRun is currently executing
         """
         if not self._db_exists():
-            session.add(self)
+            session.merge(self)
             session.commit()
 
         if self._db_query(DagRun.lock_id).scalar() not in (None, lock_id):
@@ -3570,7 +3589,7 @@ class DagRun(Base):
         """
         orm_dagrun = self._db_query().first()
         if not orm_dagrun:
-            session.add(self)
+            session.merge(self)
             session.commit()
         self.lock_id = None
         # do this instead of full merge in case other properties are not synced
@@ -3583,7 +3602,7 @@ class DagRun(Base):
         Sets the `conf` attribute for this DagRun and stores it in the database.
         """
         if not self._db_exists():
-            session.add(self)
+            session.merge(self)
             session.commit()
 
         if self._db_query(DagRun.lock_id).scalar():
@@ -3683,6 +3702,7 @@ class DagRun(Base):
             .all())
 
         finished_ids = [t.task_id for t in finished]
+
         for task in dag.tasks:
             if task.task_id in finished_ids:
                 continue

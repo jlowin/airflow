@@ -321,11 +321,13 @@ class DagRunJob(BaseJob):
             dagruns = list(dagruns)
         except TypeError:
             dagruns = [dagruns]
+        # remove None
+        dagruns = [d for d in dagruns if d]
 
         for dr in dagruns:
             dr.refresh_from_db()
             session.merge(dr)
-            session.flush()
+            # session.flush()
         session.commit()
 
         self.dagruns.update(dagruns)
@@ -374,7 +376,6 @@ class DagRunJob(BaseJob):
 
         # TODO parallelize with multiprocessing.Pool
         try:
-
             # take a lock on the dagruns
             for run in list(self.dagruns):
                 run.refresh_from_db(session=session)
@@ -392,8 +393,6 @@ class DagRunJob(BaseJob):
                     run.lock(lock_id=self.id, session=session)
 
             # send each dagrun's tasks to the executor
-            current_dag_id = None
-
             for dagrun in sorted(self.dagruns.difference(skipped_runs)):
                 try:
                     ignore_depends_on_past = (
@@ -411,7 +410,6 @@ class DagRunJob(BaseJob):
                         pool=self.pool,
                         ignore_depends_on_past=ignore_depends_on_past,
                         session=session)
-                    current_dag_id = dagrun.dag_id
                 except AirflowException as e:
                     self.logger.exception(e)
 
@@ -420,7 +418,9 @@ class DagRunJob(BaseJob):
 
             # update dagrun states
             for dag in self.dagbag.dags.values():
-                dag.update_dagrun_states(session=session)
+                dag.update_dagrun_states(
+                    ignore_depends_on_past_dates=ignore_depends_on_past_dates,
+                    session=session)
 
         except Exception as e:
             self.logger.exception(e)
@@ -551,7 +551,9 @@ class DagRunJob(BaseJob):
     @provide_session
     def manage_slas(self, session=None):
         for run in self.dagruns:
-            self._manage_slas(self.get_dag_from_dagrun(run))
+            dag = self.get_dag_from_dagrun(run)
+            if dag:
+                self._manage_slas(dag)
 
     @provide_session
     def _manage_slas(self, dag, session=None):
