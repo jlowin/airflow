@@ -167,43 +167,43 @@ class CoreTest(unittest.TestCase):
 
         assert additional_dag_run is None
 
-    # @mock.patch('airflow.models.datetime', FakeDatetime)
-    # def test_schedule_dag_no_end_date_up_to_today_only(self):
-    #     """
-    #     Tests that a Dag created without an end_date can only be scheduled up
-    #     to and including the current datetime.
-    #
-    #     For example, if today is 2016-01-01 and we are scheduling from a
-    #     start_date of 2015-01-01, only jobs up to, but not including
-    #     2016-01-01 should be scheduled.
-    #     """
-    #     from datetime import datetime
-    #     FakeDatetime.now = classmethod(lambda cls: datetime(2016, 1, 1))
-    #
-    #     session = settings.Session()
-    #     delta = timedelta(days=1)
-    #     start_date = DEFAULT_DATE
-    #     runs = 365
-    #     dag = DAG(TEST_DAG_ID + 'test_schedule_dag_no_end_date_up_to_today_only',
-    #               start_date=start_date,
-    #               schedule_interval=delta)
-    #
-    #     dag_runs = []
-    #     for i in range(runs):
-    #         # Schedule the DagRun
-    #         dagrun = dag.schedule_dag()
-    #         if dagrun:
-    #             dag_runs.append(dagrun)
-    #             # Mark the DagRun as complete
-    #             dagrun.set_state(State.SUCCESS)
-    #
-    #     # Attempt to schedule an additional dag run (for 2016-01-01)
-    #     additional_dag_run = dag.schedule_dag()
-    #
-    #     for dag_run in dag_runs:
-    #         assert dag_run is not None
-    #
-    #     assert additional_dag_run is None
+    @mock.patch('airflow.models.datetime', FakeDatetime)
+    def test_schedule_dag_no_end_date_up_to_today_only(self):
+        """
+        Tests that a Dag created without an end_date can only be scheduled up
+        to and including the current datetime.
+
+        For example, if today is 2016-01-01 and we are scheduling from a
+        start_date of 2015-01-01, only jobs up to, but not including
+        2016-01-01 should be scheduled.
+        """
+        from datetime import datetime
+        FakeDatetime.now = classmethod(lambda cls: datetime(2016, 1, 1))
+
+        session = settings.Session()
+        delta = timedelta(days=1)
+        start_date = DEFAULT_DATE
+        runs = 365
+        dag = DAG(TEST_DAG_ID + 'test_schedule_dag_no_end_date_up_to_today_only',
+                  start_date=start_date,
+                  schedule_interval=delta)
+
+        dag_runs = []
+        for i in range(runs):
+            # Schedule the DagRun
+            dagrun = dag.schedule_dag()
+            if dagrun:
+                dag_runs.append(dagrun)
+                # Mark the DagRun as complete
+                dagrun.set_state(State.SUCCESS)
+
+        # Attempt to schedule an additional dag run (for 2016-01-01)
+        additional_dag_run = dag.schedule_dag()
+
+        for dag_run in dag_runs:
+            assert dag_run is not None
+
+        assert additional_dag_run is None
 
     def test_schedule_max_active_runs(self):
         """

@@ -327,7 +327,6 @@ class DagRunJob(BaseJob):
         for dr in dagruns:
             dr.refresh_from_db()
             session.merge(dr)
-            # session.flush()
         session.commit()
 
         self.dagruns.update(dagruns)

@@ -13,7 +13,8 @@
 # limitations under the License.
 
 from airflow.exceptions import AirflowException
-from airflow.models import BaseOperator, Pool
+from airflow.models import BaseOperator, Pool, DagRun
+from airflow.jobs import DagRunJob
 from airflow.utils.decorators import apply_defaults
 from airflow.utils.db import provide_session
 from airflow.executors import DEFAULT_EXECUTOR
@@ -82,9 +83,32 @@ class SubDagOperator(BaseOperator):
         self.executor = executor
 
     def execute(self, context):
-        ed = context['execution_date']
-        self.subdag.run(
-            start_date=ed,
-            end_date=ed,
-            donot_pickle=True,
-            executor=self.executor)
+        # create a DagRun
+        execution_date = context['execution_date']
+        dagrun = DagRun(
+            dag_id=self.subdag.dag_id,
+            execution_date=execution_date)
+
+        # create a DagRunJob
+        job = DagRunJob(
+            executor=self.executor,
+            donot_pickle=True)
+
+        # submit the DagRun to the Job
+        job.submit_dagruns(dagrun)
+
+        # run the Job (will block until the DagRun stops RUNNING)
+        job.run()
+
+        # refresh the state of the DagRun
+        dagrun.refresh_from_db()
+
+        # dispatch on dagrun state
+        if dagrun.state == State.FAILED:
+            raise AirflowException('SubDag {} failed.'.format(self.subdag))
+        elif dagrun.state == State.SUCCESS:
+            pass
+        else:
+            raise AirflowException(
+                "SubDag {} doesn't report success or failure... something "
+                "probably went wrong.".format(self.subdag))

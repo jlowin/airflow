@@ -13,11 +13,22 @@ branch_labels = None
 depends_on = None
 
 from alembic import op
+from alembic import context
 import sqlalchemy as sa
 from sqlalchemy.sql.expression import false
 
 
 def upgrade():
+    url = context.config.get_main_option("sqlalchemy.url")
+    if url.find("postgresql") > -1:
+        op.drop_constraint("dag_run_dag_id_execution_date_key", "dag_run")
+        # op.create_unique_constraint("uq_dag_run_dag_id_execution_date_run_id",
+        #                             "dag_run", ["dag_id", "execution_date", "run_id"])
+    elif url.find("mysql") > -1:
+        op.drop_constraint("dag_id_2", "dag_run", "unique")
+        # op.create_unique_constraint("uq_dag_run_dag_id_execution_date_run_id",
+        #                             "dag_run", ["dag_id", "execution_date"])
+
     with op.batch_alter_table('dag_run') as batch_op:
         batch_op.drop_column('id')
         batch_op.drop_column('external_trigger')
@@ -28,6 +39,7 @@ def upgrade():
             existing_nullable=False)
         batch_op.add_column(sa.Column('lock_id', sa.Integer))
         batch_op.create_primary_key('pk_dag_run', ['dag_id', 'execution_date'])
+
 
     with op.batch_alter_table('dag') as batch_op:
         batch_op.alter_column(
